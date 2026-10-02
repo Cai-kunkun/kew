@@ -181,6 +181,8 @@ sound_result_t sound_resume_playback(void)
                 }
         }
 
+        pb_reset_stall_watchdog();
+
         if (atomic_load(&sound_s->request_pause))
                 atomic_store(&sound_s->request_pause, false);
 

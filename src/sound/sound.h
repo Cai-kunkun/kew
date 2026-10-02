@@ -21,6 +21,14 @@ extern sound_playback_repeat_state_t repeat_state;
 extern pthread_mutex_t switch_mutex;
 
 /**
+ * @brief (local patch) Resets the audio stall watchdog clock.
+ *
+ * Called when playback is (re)started so that time spent paused or stopped
+ * is not mistaken for a stalled stream by the playback watchdog.
+ */
+void pb_reset_stall_watchdog(void);
+
+/**
  * @brief Checks if the audio context has been initialized.
  *
  * This function returns the current state of the audio context, indicating whether

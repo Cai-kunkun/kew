@@ -48,6 +48,7 @@
 #include <sys/resource.h>
 #endif
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 static ma_context context;
@@ -59,6 +60,110 @@ sound_system_t *sound_s = NULL;
 sound_playback_repeat_state_t repeat_state = SOUND_STATE_REPEAT_OFF;
 
 ma_pcm_rb pcm_rb;
+
+/*
+ * ---------------------------------------------------------------------------
+ * Local patch: playback stall watchdog.
+ *
+ * On this system, a stream that was just re-created after a sample-rate
+ * switch sometimes stops receiving write callbacks entirely: the stream is
+ * READY and uncorked, but the server never asks for data again, so playback
+ * goes silent until the device is stopped and started again.
+ *
+ * The decode thread sits in the ring-buffer wait loop during such a stall, so
+ * the watchdog runs from there. If no audio callback has arrived for a while
+ * while we should still be playing, it performs a stop -> short pause -> start
+ * cycle (the same thing that pressing "stop" followed by "play" does by hand)
+ * and retries a few times if needed.
+ * ---------------------------------------------------------------------------
+ */
+
+#define WD_STALL_MS 1800
+#define WD_COOLDOWN_MS 1500
+#define WD_RESUME_DELAY_MS 600
+#define WD_MAX_KICKS 10
+
+static _Atomic ma_uint64 wd_last_callback_ms = 0;
+static ma_uint64 wd_last_kick_ms = 0;
+static ma_uint64 wd_resume_at_ms = 0;
+static int wd_kick_count = 0;
+static bool wd_pending_resume = false;
+
+static ma_uint64 wd_now_ms(void)
+{
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (ma_uint64)ts.tv_sec * 1000ULL + (ma_uint64)ts.tv_nsec / 1000000;
+}
+
+static void pb_note_audio_callback(void)
+{
+        atomic_store(&wd_last_callback_ms, wd_now_ms());
+}
+
+void pb_reset_stall_watchdog(void)
+{
+        atomic_store(&wd_last_callback_ms, wd_now_ms());
+}
+
+static void pb_playback_watchdog_check(void)
+{
+        if (!is_device_initialized())
+                return;
+
+        ma_uint64 now = wd_now_ms();
+
+        if (wd_pending_resume) {
+                if (now < wd_resume_at_ms)
+                        return;
+
+                PlaybackState *ps = get_playback_state();
+                if (pthread_mutex_trylock(&ps->switch_mutex) != 0)
+                        return; /* a switch is in progress on the main thread */
+
+                wd_pending_resume = false;
+
+                if (!pb_is_playing() && sound_s->state == SOUND_STATE_STOPPED)
+                        sound_resume_playback();
+
+                pthread_mutex_unlock(&ps->switch_mutex);
+                return;
+        }
+
+        if (!pb_is_playing() || sound_s->state != SOUND_STATE_PLAYING)
+                return;
+
+        ma_uint64 last = atomic_load(&wd_last_callback_ms);
+        if (last == 0)
+                return;
+
+        /* Audio is flowing again (and has been since the last kick): re-arm. */
+        if ((now - last) < 700 && (now - wd_last_kick_ms) > WD_COOLDOWN_MS) {
+                wd_kick_count = 0;
+                return;
+        }
+
+        if ((now - last) < WD_STALL_MS ||
+            (now - wd_last_kick_ms) < WD_COOLDOWN_MS ||
+            wd_kick_count >= WD_MAX_KICKS)
+                return;
+
+        PlaybackState *ps = get_playback_state();
+        if (pthread_mutex_trylock(&ps->switch_mutex) != 0)
+                return;
+
+        wd_last_kick_ms = now;
+        wd_kick_count++;
+
+        k_log("audio watchdog: no audio callbacks for %llu ms; restarting playback device (attempt %d/%d)\n",
+              (unsigned long long)(now - last), wd_kick_count, WD_MAX_KICKS);
+
+        stop_playback();
+        wd_resume_at_ms = wd_now_ms() + WD_RESUME_DELAY_MS;
+        wd_pending_resume = true;
+
+        pthread_mutex_unlock(&ps->switch_mutex);
+}
 
 sound_result_t create_audio_device(
     void *user_data,
@@ -778,6 +883,8 @@ void *decode_loop(void *arg)
 
                         atomic_store(&sound->buffer_ready, 1);
 
+                        pb_playback_watchdog_check();
+
                         struct timespec ts = {0, 1000000}; // 1ms
                         nanosleep(&ts, NULL);
                 }
@@ -1007,6 +1114,8 @@ void on_audio_frames(ma_device *device, void *pOutput, const void *input, ma_uin
 {
         (void)device;
         (void)input;
+
+        pb_note_audio_callback();
 
         Model *model = get_model();
 
